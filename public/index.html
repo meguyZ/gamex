@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>🍳 Cooking Together!</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a2e; display: flex; flex-direction: column;
+           align-items: center; justify-content: center; height: 100vh;
+           font-family: 'Segoe UI', sans-serif; color: #fff; }
+    #ui { margin-bottom: 10px; font-size: 14px; color: #aaa; }
+    canvas { border: 3px solid #444; border-radius: 8px; background: #2c3e50; }
+    #overlay { position: fixed; inset: 0; background: rgba(0,0,0,.8);
+               display: flex; flex-direction: column; align-items: center;
+               justify-content: center; gap: 16px; }
+    #overlay h1 { font-size: 2.5rem; }
+    #overlay p  { font-size: 1.2rem; color: #bbb; text-align: center; max-width: 480px; }
+    #overlay .score-final { font-size: 3rem; color: #f1c40f; font-weight: bold; }
+    #overlay button { padding: 12px 32px; font-size: 1rem; background: #e91e63;
+                      color: #fff; border: none; border-radius: 8px; cursor: pointer; }
+    #overlay button:hover { background: #c2185b; }
+    .toast { position: fixed; top: 80px; left: 50%; transform: translateX(-50%);
+             background: #27ae60; color: #fff; padding: 10px 24px; border-radius: 20px;
+             font-size: 1rem; font-weight: bold; pointer-events: none;
+             animation: fadeup .8s ease forwards; }
+    @keyframes fadeup {
+      0%   { opacity:1; transform: translateX(-50%) translateY(0); }
+      100% { opacity:0; transform: translateX(-50%) translateY(-40px); }
+    }
+  </style>
+</head>
+<body>
+
+<div id="ui">🍅 P1: WASD + F &nbsp;|&nbsp; 🥬 P2: Arrow Keys + Enter &nbsp;|&nbsp; Hold action key near CHOP board to cut!</div>
+<canvas id="c" width="900" height="600"></canvas>
+
+<!-- Overlay (lobby / game-over) -->
+<div id="overlay">
+  <h1>🍳 Cooking Together!</h1>
+  <p id="overlay-msg">Connecting to server...</p>
+  <button id="overlay-btn" style="display:none" onclick="location.reload()">Play Again</button>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+// ── Setup ──────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const overlay     = document.getElementById('overlay');
+const overlayMsg  = document.getElementById('overlay-msg');
+const overlayBtn  = document.getElementById('overlay-btn');
+
+const socket = io();
+
+let myNum = null, myState = null;
+let gameOver = false;
+
+// Keyboard state
+const keys = { up:false, down:false, left:false, right:false, action:false };
+let stations = {}, CANVAS_W = 900, CANVAS_H = 600, PLAYER_SIZE = 36;
+
+// ── Socket events ──────────────────────────────────────────
+socket.on('roomFull', () => {
+  overlayMsg.textContent = '❌ Room is full. Try again later.';
+});
+
+socket.on('init', (data) => {
+  myNum      = data.playerNum;
+  stations   = data.stations;
+  CANVAS_W   = data.CANVAS_W;
+  CANVAS_H   = data.CANVAS_H;
+  PLAYER_SIZE= data.PLAYER_SIZE;
+  overlayMsg.textContent = myNum === 1
+    ? '🔵 You are Player 1!\nWaiting for Player 2...'
+    : '🩷 You are Player 2!\nGet ready...';
+});
+
+socket.on('playerJoined', ({ num, total }) => {
+  if (total < 2) {
+    overlayMsg.textContent = `Player ${num} joined. Waiting for ${2 - total} more player...`;
+  } else {
+    overlayMsg.textContent = 'Both players ready! Starting in 2s...';
+  }
+});
+
+socket.on('playerLeft', ({ num }) => {
+  showToast(`⚠️ Player ${num} left!`, '#e74c3c');
+});
+
+socket.on('gameStarted', () => {
+  overlay.style.display = 'none';
+  gameOver = false;
+});
+
+socket.on('state', (data) => {
+  myState = data;
+  render(data);
+});
+
+socket.on('scored', ({ order }) => {
+  showToast(`✅ ${order} delivered! +points`, '#27ae60');
+});
+
+socket.on('wrongDish', () => {
+  showToast('❌ Wrong dish!', '#e74c3c');
+});
+
+socket.on('orderExpired', () => {
+  showToast('⏰ Order expired! -50pts', '#e67e22');
+});
+
+socket.on('gameOver', ({ score }) => {
+  gameOver = true;
+  overlay.style.display = 'flex';
+  overlayMsg.innerHTML = `<span class="score-final">Final Score: ${score}</span>`;
+  overlayBtn.style.display = 'block';
+  // render final frame
+  if (myState) render({ ...myState, timeLeft: 0 });
+});
+
+// ── Input ──────────────────────────────────────────────────
+const KEY_MAP_P1 = { w:'up', s:'down', a:'left', d:'right', f:'action' };
+const KEY_MAP_P2 = {
+  ArrowUp:'up', ArrowDown:'down', ArrowLeft:'left', ArrowRight:'right', Enter:'action'
+};
+
+document.addEventListener('keydown', (e) => {
+  e.preventDefault();
+  const map = myNum === 1 ? KEY_MAP_P1 : KEY_MAP_P2;
+  const k   = map[e.key.toLowerCase()] || map[e.key];
+  if (k && !keys[k]) { keys[k] = true; sendKeys(); }
+});
+
+document.addEventListener('keyup', (e) => {
+  const map = myNum === 1 ? KEY_MAP_P1 : KEY_MAP_P2;
+  const k   = map[e.key.toLowerCase()] || map[e.key];
+  if (k) {
+    if (k === 'action') socket.emit('interact'); // fire interact on key-up for action
+    keys[k] = false; sendKeys();
+  }
+});
+
+function sendKeys() { socket.emit('keys', { ...keys }); }
+
+// ── Rendering ──────────────────────────────────────────────
+const ITEM_COLORS = {
+  tomato_raw:   '#e74c3c', tomato_cut:   '#c0392b',
+  lettuce_raw:  '#2ecc71', lettuce_cut:  '#27ae60',
+};
+const ITEM_LABELS = {
+  tomato_raw: 'TOM', tomato_cut: 'tom✓',
+  lettuce_raw: 'LET', lettuce_cut: 'let✓',
+};
+
+function render(state) {
+  ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+
+  // Floor
+  ctx.fillStyle = '#34495e';
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+  // Grid lines
+  ctx.strokeStyle = '#2c3e50';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < CANVAS_W; x += 60) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,CANVAS_H); ctx.stroke(); }
+  for (let y = 0; y < CANVAS_H; y += 60) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(CANVAS_W,y); ctx.stroke(); }
+
+  // Stations
+  for (const [key, s] of Object.entries(stations)) {
+    ctx.fillStyle = s.color;
+    roundRect(ctx, s.x, s.y, s.w, s.h, 8);
+    ctx.fillStyle = 'rgba(0,0,0,.25)';
+    roundRect(ctx, s.x, s.y+s.h-12, s.w, 12, [0,0,8,8]);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(s.label, s.x + s.w/2, s.y + s.h/2 + 4);
+
+    // Board item + progress
+    if (s.type === 'board' && state.boards) {
+      const b = state.boards[s.id];
+      if (b && b.item) {
+        ctx.fillStyle = ITEM_COLORS[b.item] || '#aaa';
+        ctx.beginPath();
+        ctx.arc(s.x + s.w/2, s.y + s.h/2 - 10, 12, 0, Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle = '#fff'; ctx.font = '9px sans-serif';
+        ctx.fillText(ITEM_LABELS[b.item] || b.item, s.x + s.w/2, s.y + s.h/2 - 6);
+        // progress bar
+        if (b.progress > 0 && b.progress < 100) {
+          ctx.fillStyle = '#222'; ctx.fillRect(s.x+4, s.y+s.h-20, s.w-8, 8);
+          ctx.fillStyle = '#2ecc71';
+          ctx.fillRect(s.x+4, s.y+s.h-20, (s.w-8)*(b.progress/100), 8);
+        }
+        if (b.progress >= 100) {
+          ctx.fillStyle = '#2ecc71'; ctx.font = 'bold 10px sans-serif';
+          ctx.fillText('DONE!', s.x+s.w/2, s.y+s.h-10);
+        }
+      }
+    }
+
+    // Plate items
+    if (s.type === 'plate' && state.plate && state.plate.items.length > 0) {
+      state.plate.items.forEach((itm, i) => {
+        ctx.fillStyle = ITEM_COLORS[itm] || '#aaa';
+        ctx.beginPath();
+        ctx.arc(s.x+20+i*22, s.y+s.h/2, 10, 0, Math.PI*2);
+        ctx.fill();
+      });
+    }
+  }
+
+  // Players
+  if (state.players) {
+    Object.values(state.players).forEach(p => {
+      const isMe = myNum === p.num;
+
+      // Shadow
+      ctx.fillStyle = 'rgba(0,0,0,.3)';
+      ctx.beginPath(); ctx.ellipse(p.x, p.y+PLAYER_SIZE/2+2, PLAYER_SIZE/2, 6, 0, 0, Math.PI*2); ctx.fill();
+
+      // Body
+      ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, PLAYER_SIZE/2, 0, Math.PI*2); ctx.fill();
+
+      // Ring for "me"
+      if (isMe) {
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(p.x, p.y, PLAYER_SIZE/2+3, 0, Math.PI*2); ctx.stroke();
+      }
+
+      // Label
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(`P${p.num}${isMe?' (you)':''}`, p.x, p.y - PLAYER_SIZE/2 - 4);
+
+      // Held item
+      if (p.held) {
+        ctx.fillStyle = ITEM_COLORS[p.held] || '#f39c12';
+        ctx.beginPath(); ctx.arc(p.x+18, p.y-18, 12, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#fff'; ctx.font = 'bold 8px sans-serif';
+        ctx.fillText(ITEM_LABELS[p.held]||'?', p.x+18, p.y-15);
+      }
+    });
+  }
+
+  // HUD – Orders
+  if (state.orders && state.orders.length > 0) {
+    ctx.fillStyle = 'rgba(0,0,0,.6)';
+    ctx.fillRect(130, 4, CANVAS_W - 280, 60);
+    ctx.fillStyle = '#f1c40f'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText('ORDERS:', 140, 22);
+    state.orders.forEach((o, i) => {
+      const x = 220 + i * 155;
+      const urgency = o.timeLeft < 10 ? '#e74c3c' : o.timeLeft < 20 ? '#e67e22' : '#2ecc71';
+      ctx.fillStyle = urgency;
+      ctx.fillText(`${o.name} (${o.timeLeft}s)`, x, 22);
+      ctx.fillStyle = '#aaa'; ctx.font = '10px sans-serif';
+      ctx.fillText(o.items.join(' + '), x, 38);
+      ctx.font = 'bold 12px sans-serif';
+    });
+  }
+
+  // HUD – Score & Timer
+  ctx.fillStyle = '#f1c40f'; ctx.font = 'bold 20px sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText(`⭐ ${state.score}`, 12, 28);
+  const mins = Math.floor(state.timeLeft / 60);
+  const secs = String(state.timeLeft % 60).padStart(2,'0');
+  ctx.fillStyle = state.timeLeft < 30 ? '#e74c3c' : '#fff';
+  ctx.textAlign = 'right';
+  ctx.fillText(`⏱ ${mins}:${secs}`, CANVAS_W - 12, 28);
+}
+
+// ── Helpers ────────────────────────────────────────────────
+function roundRect(ctx, x, y, w, h, r) {
+  const rad = typeof r === 'number' ? [r,r,r,r] : r;
+  ctx.beginPath();
+  ctx.moveTo(x+rad[0], y);
+  ctx.lineTo(x+w-rad[1], y); ctx.arcTo(x+w,y,x+w,y+rad[1],rad[1]);
+  ctx.lineTo(x+w,y+h-rad[2]); ctx.arcTo(x+w,y+h,x+w-rad[2],y+h,rad[2]);
+  ctx.lineTo(x+rad[3],y+h); ctx.arcTo(x,y+h,x,y+h-rad[3],rad[3]);
+  ctx.lineTo(x,y+rad[0]); ctx.arcTo(x,y,x+rad[0],y,rad[0]);
+  ctx.closePath(); ctx.fill();
+}
+
+function showToast(msg, color = '#27ae60') {
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.style.background = color;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 900);
+}
+</script>
+</body>
+</html>
+```
+
+---
+
+## 🚀 วิธี Deploy บน Replit
+
+1. **สร้างโปรเจกต์ใหม่** → เลือก "Node.js"
+2. **สร้าง 3 ไฟล์** ตามโครงสร้างด้านบน (index.js, package.json, public/index.html)
+3. **กด Run** → Replit จะรัน `npm install` แล้ว start server
+4. **แชร์ URL** ให้เพื่อนเปิดอีก browser หนึ่ง — ทั้งสองคนจะ join ห้องเดียวกันอัตโนมัติ
+
+---
+
+## 🎮 Controls
+
+| Player | ย้าย | Action (หยิบ/วาง/เสิร์ฟ) | ตัด (ค้างไว้) |
+|--------|------|--------------------------|--------------|
+| P1 | `W A S D` | `F` (keyup) | ค้าง `F` ใกล้ CHOP board |
+| P2 | `Arrow Keys` | `Enter` (keyup) | ค้าง `Enter` ใกล้ CHOP board |
+
+## 🔄 Game Flow
+```
+หยิบจาก Crate → วางบน CHOP board → ค้างปุ่ม action ตัด → หยิบขึ้นมา
+→ เสิร์ฟตรงที่ SERVE (ถ้า 1 ชิ้น) หรือวางบน PLATE ก่อน แล้วค้าง action ที่ SERVE
